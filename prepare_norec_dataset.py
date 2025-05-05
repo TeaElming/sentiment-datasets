@@ -1,87 +1,106 @@
+"""
+Create balanced train / validation / test splits for the
+NOREC-translated corpus and save them as a Hugging-Face DatasetDict.
+
+Output folder: ./processed_norec_translated_dataset
+(removed and recreated on every run)
+"""
+
 import os
 import json
+import shutil
 import pandas as pd
 from collections import OrderedDict
 from datasets import Dataset, DatasetDict
+from sklearn.model_selection import train_test_split
+from concurrent.futures import ThreadPoolExecutor
+import tqdm
 
-# Paths to data
-metadata_file = "./data/norec_translated/metadata_v_2_0.json"
-train_folder = "./data/norec_translated/train"
-# Uncomment these when dev and test data are available
-# dev_folder = "./data/norec_translated/dev"
-# test_folder = "./data/norec_translated/test"
+# ──────────────────────────────────────────────────────────── paths
+ROOT_DIR   = "./data/norec_translated"
+TXT_DIR  = os.path.join(ROOT_DIR, "train")
+META_FILE  = os.path.join(ROOT_DIR, "metadata_v_2_0.json")
+OUT_DIR    = "./processed_norec_translated_dataset"
 
+# ──────────────────────────────────────────────────── helpers / load
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import tqdm  # pip install tqdm   ▸ nice progress bar (optional)
 
-def convert_rating(rating):
-    """
-    Converts a numeric rating into a 3-class sentiment label.
-    Mapping: ratings 1-2 -> 0 (Negative), 3-4 -> 1 (Neutral), 5-6 -> 2 (Positive)
-    Adjust thresholds as needed.
-    """
-    if rating < 3:
-        return 0
-    elif rating < 5:
-        return 1
-    else:
-        return 2
+def convert_rating(r: int) -> int:
+    return 0 if r < 3 else (1 if r < 5 else 2)
 
-
-# Load metadata from JSON file in the exact order it appears
-with open(metadata_file, "r", encoding="utf-8") as f:
-    metadata = json.loads(f.read(), object_pairs_hook=OrderedDict)
-
-data = []
-missing_files = []
-
-# Process entries for the train split in the original JSON order
-for key, info in metadata.items():
-    if info.get("split") != "train":
-        continue
-
-    file_path = os.path.join(train_folder, f"{key}.txt")
-
-    # Attempt to read the corresponding text file
+def _read_one(item):
+    """Worker: read a single TXT file; return row-dict or None."""
+    doc_id, info = item
+    path = os.path.join(TXT_DIR, f"{doc_id}.txt")
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             text = f.read().strip()
+        return {"text": text, "label": convert_rating(info["rating"])}
     except FileNotFoundError:
-        # If the file is missing, store the name and skip
-        missing_files.append(file_path)
-        continue
-    except Exception as e:
-        # Log any other file-read issue and skip
-        print(f"Error reading {file_path}: {e}")
-        missing_files.append(file_path)
-        continue
+        return None
 
-    rating = info.get("rating")
-    if rating is None:
-        # If rating is missing, you could handle or skip similarly
-        print(f"Missing rating for {key}. Skipping.")
-        continue
+def load_reviews(workers: int | None = None) -> pd.DataFrame:
+    """Read all reviews in parallel; returns DataFrame."""
+    with open(META_FILE, encoding="utf-8") as f:
+        meta = json.load(f, object_pairs_hook=OrderedDict)
 
-    label = convert_rating(rating)
-    data.append({"text": text, "label": label})
+    rows, missing = [], 0
+    workers = workers or os.cpu_count() or 4
 
-df = pd.DataFrame(data)
-print(f"Loaded {len(df)} samples from the train split.")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        # tqdm is optional – remove if you don’t want the bar
+        for row in tqdm.tqdm(pool.map(_read_one, meta.items()), total=len(meta)):
+            if row is None:
+                missing += 1
+            else:
+                rows.append(row)
 
-# Create the Hugging Face DatasetDict
-dataset = DatasetDict({
-    "train": Dataset.from_pandas(df),
-    # When dev and test splits are ready, do similarly for dev/test:
-    # "validation": Dataset.from_pandas(dev_df),
-    # "test": Dataset.from_pandas(test_df),
-})
+    if missing:
+        print(f"⚠️  {missing} TXT files listed in metadata were missing.")
+    print(f"✅ Loaded {len(rows)} usable reviews "
+          f"(threads used: {workers}).")
 
-dataset.save_to_disk("./data_proc/processed_norec_translated_dataset")
-print("✅ Norec Translated dataset processed and saved!")
+    return pd.DataFrame(rows)
 
-# Final summary of missing files
-if missing_files:
+# ────────────────────────────────────────────────────────── splits
+def make_splits(df: pd.DataFrame):
+    # balanced test set (≤ 500 per class or the class minimum)
+    per_cls = min(df["label"].value_counts().min(), 500)
+    test_df = (
+        df.groupby("label")
+          .apply(lambda x: x.sample(n=per_cls, random_state=42, replace=False))
+          .reset_index(drop=True)
+    )
+    remaining_df = df.drop(test_df.index)
+    train_df, val_df = train_test_split(
+        remaining_df,
+        test_size=0.2,
+        stratify=remaining_df["label"],
+        random_state=42,
+    )
+    return train_df, val_df, test_df
+
+# ────────────────────────────────────────────────────── save dataset
+def save_dataset(train_df, val_df, test_df):
+    if os.path.isdir(OUT_DIR):
+        shutil.rmtree(OUT_DIR)
+
+    ds = DatasetDict({
+        "train":      Dataset.from_pandas(train_df.reset_index(drop=True)),
+        "validation": Dataset.from_pandas(val_df.reset_index(drop=True)),
+        "test":       Dataset.from_pandas(test_df.reset_index(drop=True)),
+    })
+    ds.save_to_disk(OUT_DIR)
+
     print(
-        f"Processing finished. {len(missing_files)} files were not processed:")
-    for mf in missing_files:
-        print(f" - {mf}")
-else:
-    print("Processing finished. All files were processed successfully.")
+        f"✅ Saved to {OUT_DIR} │ "
+        f"train {len(train_df)} │ val {len(val_df)} │ "
+        f"test {len(test_df)} (each class ≤ {test_df['label'].value_counts().max()})"
+    )
+
+# ────────────────────────────────────────────────────────── main
+if __name__ == "__main__":
+    df = load_reviews()
+    train_df, val_df, test_df = make_splits(df)
+    save_dataset(train_df, val_df, test_df)
